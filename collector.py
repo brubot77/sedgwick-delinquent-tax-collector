@@ -474,23 +474,24 @@ async def submit_search(page: Page, owner: str) -> None:
                     document.documentElement.outerHTML !== oldHtml;
 
                 const hasResultCount =
-                    /\\b\\d+\\s+RESULTS?\\b/i.test(body);
+                    /\b\d+\s+RESULTS?\b/i.test(body);
 
                 const hasPayTaxes =
-                    /PAY\\s+TAXES/i.test(body);
+                    /PAY\s+TAXES/i.test(body);
 
                 const hasNoResults =
-                    /NO\\s+(MATCHING\\s+)?RESULTS/i.test(body) ||
-                    /NO\\s+DELINQUENT/i.test(body) ||
-                    /0\\s+RESULTS?/i.test(body);
+                    /NO\s+(MATCHING\s+)?RESULTS/i.test(body) ||
+                    /NO\s+DELINQUENT/i.test(body) ||
+                    /0\s+RESULTS?/i.test(body);
 
                 return htmlChanged &&
                     (hasResultCount || hasPayTaxes || hasNoResults);
             }
             """,
-            [owner, before_html],
+            arg=[owner, before_html],
             timeout=30_000,
         )
+
     except PlaywrightTimeoutError:
         body_text = normalize_space(
             await page.locator("body").inner_text()
