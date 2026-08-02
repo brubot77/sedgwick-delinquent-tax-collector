@@ -350,39 +350,173 @@ async def click_intro_if_present(page: Page) -> None:
 
 
 async def locate_search_input(page: Page):
-    selectors = [
-        'input[name*="name" i]',
-        'input[id*="name" i]',
-        'input[type="text"]',
+    """
+    Locate only the delinquent-tax owner search field.
+
+    Avoid generic text inputs because the county page includes site search,
+    Google Translate, and other unrelated controls.
+    """
+    candidates = [
+        page.get_by_placeholder(
+            re.compile(r"^\s*name\s+or\s+partial\s+name\s*$", re.I)
+        ),
+        page.get_by_label(
+            re.compile(r"name\s+or\s+partial\s+name", re.I)
+        ),
+        page.locator(
+            'input[placeholder*="partial name" i]'
+        ),
+        page.locator(
+            'input[aria-label*="partial name" i]'
+        ),
     ]
-    for selector in selectors:
-        loc = page.locator(selector)
-        for i in range(await loc.count()):
-            el = loc.nth(i)
-            if await el.is_visible() and await el.is_enabled():
-                return el
+
+    for locator in candidates:
+        for index in range(await locator.count()):
+            element = locator.nth(index)
+
+            try:
+                if await element.is_visible() and await element.is_enabled():
+                    return element
+            except Exception:
+                continue
+
     return None
 
 
 async def submit_search(page: Page, owner: str) -> None:
     search_input = await locate_search_input(page)
-    if search_input is None:
-        raise RuntimeError("Could not locate owner-name search input")
-    await search_input.fill(owner)
 
-    buttons = [
-        page.get_by_role("button", name=re.compile(r"search|submit|find", re.I)),
-        page.locator('input[type="submit"]'),
+    if search_input is None:
+        raise RuntimeError(
+            "Could not locate the delinquent-tax 'Name or partial name' field"
+        )
+
+    # Clear and fill the exact delinquent-tax owner field.
+    await search_input.click()
+    await search_input.fill("")
+    await search_input.fill(owner)
+    await search_input.dispatch_event("input")
+    await search_input.dispatch_event("change")
+
+    entered_value = await search_input.input_value()
+
+    if normalize_space(entered_value) != normalize_space(owner):
+        raise RuntimeError(
+            "Owner value was not entered correctly. "
+            f"Expected={owner!r}; actual={entered_value!r}"
+        )
+
+    # Scope the SEARCH button to the same form/container as the owner field.
+    search_form = search_input.locator("xpath=ancestor::form[1]")
+
+    if await search_form.count() == 0:
+        raise RuntimeError(
+            "Could not locate the form containing the delinquent-tax owner field"
+        )
+
+    search_buttons = [
+        search_form.get_by_role(
+            "button",
+            name=re.compile(r"^\s*search\s*$", re.I),
+        ),
+        search_form.locator(
+            'input[type="submit"][value="SEARCH" i]'
+        ),
+        search_form.locator(
+            'input[type="button"][value="SEARCH" i]'
+        ),
+        search_form.locator(
+            'button:has-text("SEARCH")'
+        ),
+        search_form.locator(
+            'a:has-text("SEARCH")'
+        ),
     ]
-    for loc in buttons:
-        for i in range(await loc.count()):
-            el = loc.nth(i)
-            if await el.is_visible() and await el.is_enabled():
-                await el.click()
-                await page.wait_for_load_state("networkidle", timeout=30_000)
-                return
-    await search_input.press("Enter")
-    await page.wait_for_load_state("networkidle", timeout=30_000)
+
+    search_button = None
+
+    for locator in search_buttons:
+        for index in range(await locator.count()):
+            element = locator.nth(index)
+
+            try:
+                if await element.is_visible() and await element.is_enabled():
+                    search_button = element
+                    break
+            except Exception:
+                continue
+
+        if search_button is not None:
+            break
+
+    if search_button is None:
+        raise RuntimeError(
+            "Could not locate the SEARCH control inside the delinquent-tax form"
+        )
+
+    before_url = page.url
+    before_html = await page.content()
+
+    await search_button.click()
+
+    # Do not rely solely on networkidle. The county may update the results
+    # asynchronously while leaving the URL unchanged.
+    try:
+        await page.wait_for_function(
+            """
+            ([owner, oldHtml]) => {
+                const body = document.body
+                    ? document.body.innerText
+                    : "";
+
+                const htmlChanged =
+                    document.documentElement.outerHTML !== oldHtml;
+
+                const hasResultCount =
+                    /\\b\\d+\\s+RESULTS?\\b/i.test(body);
+
+                const hasPayTaxes =
+                    /PAY\\s+TAXES/i.test(body);
+
+                const hasNoResults =
+                    /NO\\s+(MATCHING\\s+)?RESULTS/i.test(body) ||
+                    /NO\\s+DELINQUENT/i.test(body) ||
+                    /0\\s+RESULTS?/i.test(body);
+
+                return htmlChanged &&
+                    (hasResultCount || hasPayTaxes || hasNoResults);
+            }
+            """,
+            [owner, before_html],
+            timeout=30_000,
+        )
+    except PlaywrightTimeoutError:
+        body_text = normalize_space(
+            await page.locator("body").inner_text()
+        )
+
+        current_value = ""
+
+        try:
+            current_input = await locate_search_input(page)
+
+            if current_input is not None:
+                current_value = await current_input.input_value()
+        except Exception:
+            pass
+
+        raise RuntimeError(
+            "The county search did not produce a confirmed results page. "
+            f"Owner={owner!r}; "
+            f"input_value={current_value!r}; "
+            f"before_url={before_url!r}; "
+            f"after_url={page.url!r}; "
+            f"body_preview={body_text[:500]!r}"
+        )
+
+    await page.wait_for_timeout(1_000)
+
 
 
 def find_value_by_header(headers: list[str], cells: list[str], patterns: list[str]) -> str:
@@ -795,10 +929,52 @@ async def run(args: argparse.Namespace) -> int:
 
                 if results:
                     store.save_results(owner_key, owner, results, "found")
-                    print(f"[{index}/{len(owners)}] FOUND {owner!r}: {len(results)} row(s)")
+                    print(
+                        f"[{index}/{len(owners)}] "
+                        f"FOUND {owner!r}: {len(results)} row(s)"
+                    )
                 else:
-                    store.save_results(owner_key, owner, [SearchResult(owner, owner_key, "not_found", source_url=page.url)], "not_found")
-                    print(f"[{index}/{len(owners)}] NOT FOUND {owner!r}")
+                    body_text = normalize_space(
+                        await page.locator("body").inner_text()
+                    )
+
+                    explicit_no_results = bool(
+                        re.search(
+                            r"\b(?:0\s+RESULTS?|"
+                            r"NO\s+(?:MATCHING\s+)?RESULTS?|"
+                            r"NO\s+DELINQUENT(?:\s+PROPERTIES)?)\b",
+                            body_text,
+                            re.I,
+                        )
+                    )
+
+                    if explicit_no_results:
+                        store.save_results(
+                            owner_key,
+                            owner,
+                            [
+                                SearchResult(
+                                    owner,
+                                    owner_key,
+                                    "not_found",
+                                    source_url=page.url,
+                                )
+                            ],
+                            "not_found",
+                        )
+
+                        print(
+                            f"[{index}/{len(owners)}] "
+                            f"NOT FOUND {owner!r}"
+                        )
+                    else:
+                        raise RuntimeError(
+                            "Search completed but no rows were parsed and the county "
+                            "did not display an explicit no-results message. "
+                            f"Owner={owner!r}; URL={page.url!r}; "
+                            f"body_preview={body_text[:500]!r}"
+                        )
+                    
             except (PlaywrightTimeoutError, Exception) as exc:
                 error = f"{type(exc).__name__}: {exc}"
                 try:
