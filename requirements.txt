@@ -1,0 +1,2 @@
+playwright>=1.54,<2
+beautifulsoup4>=4.13,<5
