@@ -238,22 +238,113 @@ def load_seed_csv(path: Path) -> list[SeedParcel]:
 
 
 async def click_intro_if_present(page: Page) -> None:
-    # The site may show an introductory/acknowledgment page before the search form.
-    candidates = [
-        page.get_by_role("button", name=re.compile(r"continue|accept|agree|proceed|search", re.I)),
-        page.get_by_role("link", name=re.compile(r"continue|accept|agree|proceed", re.I)),
-        page.locator("input[type=submit]"),
+    """
+    Pass the Sedgwick County delinquent-tax introduction page.
+
+    Do not use a generic input[type=submit] selector here because the page
+    contains site-wide search/navigation controls that can redirect to the
+    main county homepage.
+    """
+    if "delinquenciesintro.aspx" not in page.url.lower():
+        return
+
+    exact_candidates = [
+        page.get_by_role(
+            "button",
+            name=re.compile(
+                r"^(continue|proceed|accept|i accept|agree|i agree|enter|view listings)$",
+                re.I,
+            ),
+        ),
+        page.get_by_role(
+            "link",
+            name=re.compile(
+                r"^(continue|proceed|accept|i accept|agree|i agree|enter|view listings)$",
+                re.I,
+            ),
+        ),
+        page.locator(
+            'main input[type="submit"][value*="Continue" i], '
+            'main input[type="submit"][value*="Accept" i], '
+            'main input[type="submit"][value*="Agree" i], '
+            'main input[type="submit"][value*="Proceed" i], '
+            'main input[type="submit"][value*="Enter" i]'
+        ),
+        page.locator(
+            '#main input[type="submit"][value*="Continue" i], '
+            '#main input[type="submit"][value*="Accept" i], '
+            '#main input[type="submit"][value*="Agree" i], '
+            '#main input[type="submit"][value*="Proceed" i], '
+            '#main input[type="submit"][value*="Enter" i]'
+        ),
     ]
-    for locator in candidates:
+
+    for locator in exact_candidates:
         try:
-            n = await locator.count()
-            for i in range(n):
-                el = locator.nth(i)
-                if await el.is_visible():
-                    await el.click()
-                    await page.wait_for_load_state("networkidle", timeout=20_000)
-                    if "delinquencies.aspx" in page.url.lower():
-                        return
+            for index in range(await locator.count()):
+                element = locator.nth(index)
+
+                if not await element.is_visible():
+                    continue
+
+                await element.click()
+                await page.wait_for_load_state("domcontentloaded", timeout=20_000)
+                await page.wait_for_timeout(1_000)
+
+                if await locate_search_input(page) is not None:
+                    return
+        except Exception:
+            continue
+
+    # Inspect forms in the page content, excluding header and navigation forms.
+    forms = page.locator("main form, #main form, form[action*='delinquenc' i]")
+
+    for form_index in range(await forms.count()):
+        form = forms.nth(form_index)
+
+        try:
+            if not await form.is_visible():
+                continue
+
+            controls = form.locator(
+                "button, input[type='submit'], input[type='button']"
+            )
+
+            for control_index in range(await controls.count()):
+                control = controls.nth(control_index)
+
+                if not await control.is_visible():
+                    continue
+
+                label = normalize_space(
+                    " ".join(
+                        filter(
+                            None,
+                            [
+                                await control.inner_text(),
+                                await control.get_attribute("value"),
+                                await control.get_attribute("aria-label"),
+                                await control.get_attribute("title"),
+                            ],
+                        )
+                    )
+                )
+
+                # Explicitly avoid site navigation/search controls.
+                if re.search(
+                    r"search site|mobile search|home|cancel|decline|disagree|back",
+                    label,
+                    re.I,
+                ):
+                    continue
+
+                await control.click()
+                await page.wait_for_load_state("domcontentloaded", timeout=20_000)
+                await page.wait_for_timeout(1_000)
+
+                if await locate_search_input(page) is not None:
+                    return
+
         except Exception:
             continue
 
@@ -362,11 +453,78 @@ def parse_results(html: str, searched_owner: str, owner_key: str, source_url: st
 
 
 async def ensure_search_page(page: Page) -> None:
-    await page.goto(START_URL, wait_until="networkidle", timeout=45_000)
-    await click_intro_if_present(page)
-    if await locate_search_input(page) is None:
-        raise RuntimeError(f"Search form not found after intro. Current URL: {page.url}")
+    intro_url = (
+        "https://ssc.sedgwickcounty.org/propertytax/"
+        "delinquenciesintro.aspx?"
+        "returnURL=%2Fpropertytax%2Fdelinquencies.aspx"
+    )
 
+    await page.goto(
+        intro_url,
+        wait_until="domcontentloaded",
+        timeout=45_000,
+    )
+    await page.wait_for_timeout(1_000)
+
+    # The county may occasionally load the search page directly.
+    if await locate_search_input(page) is not None:
+        return
+
+    await click_intro_if_present(page)
+
+    if await locate_search_input(page) is not None:
+        return
+
+    # One direct navigation attempt after the introduction/session step.
+    await page.goto(
+        START_URL,
+        wait_until="domcontentloaded",
+        timeout=45_000,
+    )
+    await page.wait_for_timeout(1_000)
+
+    if await locate_search_input(page) is not None:
+        return
+
+    # Produce useful diagnostic information.
+    visible_controls: list[str] = []
+
+    controls = page.locator(
+        "button, input[type='submit'], input[type='button'], a"
+    )
+
+    for index in range(min(await controls.count(), 100)):
+        element = controls.nth(index)
+
+        try:
+            if not await element.is_visible():
+                continue
+
+            label = normalize_space(
+                " ".join(
+                    filter(
+                        None,
+                        [
+                            await element.inner_text(),
+                            await element.get_attribute("value"),
+                            await element.get_attribute("aria-label"),
+                            await element.get_attribute("title"),
+                            await element.get_attribute("href"),
+                        ],
+                    )
+                )
+            )
+
+            if label:
+                visible_controls.append(label[:200])
+        except Exception:
+            continue
+
+    raise RuntimeError(
+        "Search form not found. "
+        f"Current URL: {page.url}. "
+        f"Visible controls: {visible_controls[:30]}"
+    )
 
 async def run(args: argparse.Namespace) -> int:
     seed_path = Path(args.input).resolve()
