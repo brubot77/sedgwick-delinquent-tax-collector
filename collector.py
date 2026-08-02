@@ -451,6 +451,230 @@ def parse_results(html: str, searched_owner: str, owner_key: str, source_url: st
                 )
     return results
 
+async def parse_results_from_page(
+    page: Page,
+    searched_owner: str,
+    owner_key: str,
+) -> list[SearchResult]:
+    """
+    Parse Sedgwick County's rendered result grid.
+
+    The current county page is not a conventional HTML table. Each result
+    contains an owner, property-address link, PIN link, type, and PAY TAXES
+    button. Parse the rendered browser DOM rather than relying on <table>/<tr>.
+    """
+    results: list[SearchResult] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    while True:
+        await page.wait_for_timeout(750)
+
+        # Each actual property row contains a PAY TAXES control.
+        pay_controls = page.get_by_text(
+            re.compile(r"^\s*PAY\s+TAXES\s*$", re.I),
+            exact=False,
+        )
+
+        control_count = await pay_controls.count()
+
+        for index in range(control_count):
+            pay_control = pay_controls.nth(index)
+
+            try:
+                if not await pay_control.is_visible():
+                    continue
+
+                # Walk upward until we find the smallest container that contains
+                # the owner, address, PIN and property type for this result.
+                row = pay_control.locator(
+                    "xpath=ancestor::*["
+                    ".//a and "
+                    "contains(translate(normalize-space(.), "
+                    "'abcdefghijklmnopqrstuvwxyz', "
+                    "'ABCDEFGHIJKLMNOPQRSTUVWXYZ'), 'PAY TAXES')"
+                    "][1]"
+                )
+
+                if await row.count() == 0:
+                    continue
+
+                row = row.first
+                raw_text = normalize_space(await row.inner_text())
+
+                if not raw_text:
+                    continue
+
+                links = row.locator("a")
+                link_values: list[tuple[str, str]] = []
+
+                for link_index in range(await links.count()):
+                    link = links.nth(link_index)
+
+                    try:
+                        text = normalize_space(await link.inner_text())
+                        href = await link.get_attribute("href") or ""
+
+                        if text:
+                            link_values.append((text, href))
+                    except Exception:
+                        continue
+
+                property_address = ""
+                parcel_id = ""
+                result_owner = ""
+                property_type = ""
+
+                # PIN appears as an 8-digit linked value in the current page.
+                for text, _href in link_values:
+                    compact = re.sub(r"\D", "", text)
+
+                    if len(compact) == 8:
+                        parcel_id = compact
+                        break
+
+                # The property address is another link in the same row.
+                for text, _href in link_values:
+                    if text.upper() in {"PAY TAXES", "HOME"}:
+                        continue
+
+                    if re.fullmatch(r"\d{8}", re.sub(r"\D", "", text)):
+                        continue
+
+                    if re.search(
+                        r"\b(?:AVE|AVENUE|ST|STREET|RD|ROAD|LN|LANE|DR|DRIVE|"
+                        r"CT|COURT|BLVD|BOULEVARD|PL|PLACE|PKWY|HWY|CIR|WAY|"
+                        r"TER|TRAIL|WICHITA|HAYSVILLE|DERBY|MAIZE|GODDARD|"
+                        r"VALLEY CENTER|KECHI|CLEARWATER|MULVANE|CHENEY)\b",
+                        text,
+                        re.I,
+                    ):
+                        property_address = text
+                        break
+
+                # Remove known values from the full row to identify owner/type.
+                text_lines = [
+                    normalize_space(line)
+                    for line in (await row.inner_text()).splitlines()
+                    if normalize_space(line)
+                ]
+
+                for line in text_lines:
+                    if re.fullmatch(r"PAY\s+TAXES", line, re.I):
+                        continue
+
+                    if parcel_id and re.sub(r"\D", "", line) == parcel_id:
+                        continue
+
+                    if property_address and line == property_address:
+                        continue
+
+                    if re.fullmatch(r"REAL|PERSONAL|MOBILE HOME", line, re.I):
+                        property_type = line
+                        continue
+
+                    if not result_owner:
+                        result_owner = line
+
+                key = (
+                    normalize_owner(result_owner),
+                    parcel_id,
+                    normalize_space(property_address).upper(),
+                )
+
+                if key in seen:
+                    continue
+
+                seen.add(key)
+
+                results.append(
+                    SearchResult(
+                        searched_owner=searched_owner,
+                        owner_key=owner_key,
+                        search_status="found",
+                        result_owner=result_owner,
+                        parcel_id=parcel_id,
+                        property_address=property_address,
+                        raw_row_text=raw_text,
+                        source_url=page.url,
+                        searched_at_utc=utc_now(),
+                    )
+                )
+
+            except Exception:
+                continue
+
+        # Locate the enabled next-page arrow. The current page shows single and
+        # double right arrows after the numbered page controls.
+        next_candidates = [
+            page.get_by_role(
+                "link",
+                name=re.compile(r"^(next|>)$", re.I),
+            ),
+            page.get_by_role(
+                "button",
+                name=re.compile(r"^(next|>)$", re.I),
+            ),
+            page.locator(
+                "a[aria-label*='next' i], "
+                "button[aria-label*='next' i], "
+                "a[title*='next' i], "
+                "button[title*='next' i]"
+            ),
+        ]
+
+        next_control = None
+
+        for candidate in next_candidates:
+            for candidate_index in range(await candidate.count()):
+                element = candidate.nth(candidate_index)
+
+                try:
+                    if not await element.is_visible():
+                        continue
+
+                    disabled = (
+                        await element.get_attribute("disabled") is not None
+                        or (await element.get_attribute("aria-disabled") or "").lower()
+                        == "true"
+                        or "disabled"
+                        in (await element.get_attribute("class") or "").lower()
+                    )
+
+                    if not disabled:
+                        next_control = element
+                        break
+                except Exception:
+                    continue
+
+            if next_control is not None:
+                break
+
+        if next_control is None:
+            break
+
+        old_first_pin = results[-1].parcel_id if results else ""
+
+        try:
+            await next_control.click()
+            await page.wait_for_load_state("networkidle", timeout=30_000)
+            await page.wait_for_timeout(750)
+
+            # Prevent an endless loop if the page control did not advance.
+            current_text = normalize_space(await page.locator("body").inner_text())
+
+            if old_first_pin and current_text.count(old_first_pin) > 0:
+                # It may still be present elsewhere, so only stop when no new
+                # PAY TAXES result can be identified on another pass.
+                current_count = len(results)
+                await page.wait_for_timeout(300)
+
+                if len(results) == current_count:
+                    break
+
+        except Exception:
+            break
+
+    return results
 
 async def ensure_search_page(page: Page) -> None:
     intro_url = (
@@ -562,7 +786,13 @@ async def run(args: argparse.Namespace) -> int:
                 await submit_search(page, owner)
                 html = await page.content()
                 (raw_dir / f"{slug}.html").write_text(html, encoding="utf-8")
-                results = parse_results(html, owner, owner_key, page.url)
+
+                results = await parse_results_from_page(
+                    page,
+                    owner,
+                    owner_key,
+                )
+
                 if results:
                     store.save_results(owner_key, owner, results, "found")
                     print(f"[{index}/{len(owners)}] FOUND {owner!r}: {len(results)} row(s)")
