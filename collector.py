@@ -474,7 +474,7 @@ async def submit_search(page: Page, owner: str) -> None:
                     document.documentElement.outerHTML !== oldHtml;
 
                 const hasResultCount =
-                    /\b\d+\s+RESULTS?\b/i.test(body);
+                    /\\b\\d+\\s+RESULTS?\\b/i.test(body);
 
                 const hasPayTaxes =
                     /PAY\s+TAXES/i.test(body);
@@ -592,219 +592,228 @@ async def parse_results_from_page(
     owner_key: str,
 ) -> list[SearchResult]:
     """
-    Parse Sedgwick County's rendered result grid.
+    Parse the rendered Sedgwick County result pages.
 
-    The current county page is not a conventional HTML table. Each result
-    contains an owner, property-address link, PIN link, type, and PAY TAXES
-    button. Parse the rendered browser DOM rather than relying on <table>/<tr>.
+    The county's visual grid does not use a dependable conventional table
+    structure. Its rendered text consistently follows this pattern:
+
+        Owner
+        Address
+        8-digit PIN
+        Real / Personal / Mobile Home
+        PAY TAXES
+
+    Parse around the PIN and then advance through pagination.
     """
     results: list[SearchResult] = []
     seen: set[tuple[str, str, str]] = set()
+    visited_pages: set[str] = set()
 
     while True:
         await page.wait_for_timeout(750)
 
-        # Each actual property row contains a PAY TAXES control.
-        pay_controls = page.get_by_text(
-            re.compile(r"^\s*PAY\s+TAXES\s*$", re.I),
-            exact=False,
-        )
+        body_text = await page.locator("body").inner_text()
 
-        control_count = await pay_controls.count()
+        # Preserve visible line boundaries while removing blank lines.
+        lines = [
+            normalize_space(line)
+            for line in body_text.splitlines()
+            if normalize_space(line)
+        ]
 
-        for index in range(control_count):
-            pay_control = pay_controls.nth(index)
+        page_rows_found = 0
 
-            try:
-                if not await pay_control.is_visible():
-                    continue
-
-                # Walk upward until we find the smallest container that contains
-                # the owner, address, PIN and property type for this result.
-                row = pay_control.locator(
-                    "xpath=ancestor::*["
-                    ".//a and "
-                    "contains(translate(normalize-space(.), "
-                    "'abcdefghijklmnopqrstuvwxyz', "
-                    "'ABCDEFGHIJKLMNOPQRSTUVWXYZ'), 'PAY TAXES')"
-                    "][1]"
-                )
-
-                if await row.count() == 0:
-                    continue
-
-                row = row.first
-                raw_text = normalize_space(await row.inner_text())
-
-                if not raw_text:
-                    continue
-
-                links = row.locator("a")
-                link_values: list[tuple[str, str]] = []
-
-                for link_index in range(await links.count()):
-                    link = links.nth(link_index)
-
-                    try:
-                        text = normalize_space(await link.inner_text())
-                        href = await link.get_attribute("href") or ""
-
-                        if text:
-                            link_values.append((text, href))
-                    except Exception:
-                        continue
-
-                property_address = ""
-                parcel_id = ""
-                result_owner = ""
-                property_type = ""
-
-                # PIN appears as an 8-digit linked value in the current page.
-                for text, _href in link_values:
-                    compact = re.sub(r"\D", "", text)
-
-                    if len(compact) == 8:
-                        parcel_id = compact
-                        break
-
-                # The property address is another link in the same row.
-                for text, _href in link_values:
-                    if text.upper() in {"PAY TAXES", "HOME"}:
-                        continue
-
-                    if re.fullmatch(r"\d{8}", re.sub(r"\D", "", text)):
-                        continue
-
-                    if re.search(
-                        r"\b(?:AVE|AVENUE|ST|STREET|RD|ROAD|LN|LANE|DR|DRIVE|"
-                        r"CT|COURT|BLVD|BOULEVARD|PL|PLACE|PKWY|HWY|CIR|WAY|"
-                        r"TER|TRAIL|WICHITA|HAYSVILLE|DERBY|MAIZE|GODDARD|"
-                        r"VALLEY CENTER|KECHI|CLEARWATER|MULVANE|CHENEY)\b",
-                        text,
-                        re.I,
-                    ):
-                        property_address = text
-                        break
-
-                # Remove known values from the full row to identify owner/type.
-                text_lines = [
-                    normalize_space(line)
-                    for line in (await row.inner_text()).splitlines()
-                    if normalize_space(line)
-                ]
-
-                for line in text_lines:
-                    if re.fullmatch(r"PAY\s+TAXES", line, re.I):
-                        continue
-
-                    if parcel_id and re.sub(r"\D", "", line) == parcel_id:
-                        continue
-
-                    if property_address and line == property_address:
-                        continue
-
-                    if re.fullmatch(r"REAL|PERSONAL|MOBILE HOME", line, re.I):
-                        property_type = line
-                        continue
-
-                    if not result_owner:
-                        result_owner = line
-
-                key = (
-                    normalize_owner(result_owner),
-                    parcel_id,
-                    normalize_space(property_address).upper(),
-                )
-
-                if key in seen:
-                    continue
-
-                seen.add(key)
-
-                results.append(
-                    SearchResult(
-                        searched_owner=searched_owner,
-                        owner_key=owner_key,
-                        search_status="found",
-                        result_owner=result_owner,
-                        parcel_id=parcel_id,
-                        property_address=property_address,
-                        raw_row_text=raw_text,
-                        source_url=page.url,
-                        searched_at_utc=utc_now(),
-                    )
-                )
-
-            except Exception:
+        for index, line in enumerate(lines):
+            # County PIN is displayed as exactly eight digits.
+            if not re.fullmatch(r"\d{8}", line):
                 continue
 
-        # Locate the enabled next-page arrow. The current page shows single and
-        # double right arrows after the numbered page controls.
+            if index < 2:
+                continue
+
+            pin = line
+            result_owner = lines[index - 2]
+            property_address = lines[index - 1]
+
+            property_type = ""
+            pay_taxes_found = False
+
+            # Usually type immediately follows PIN and PAY TAXES follows type.
+            for offset in range(1, 5):
+                next_index = index + offset
+
+                if next_index >= len(lines):
+                    break
+
+                next_line = lines[next_index]
+
+                if re.fullmatch(
+                    r"(?:REAL|PERSONAL|MOBILE\s+HOME)",
+                    next_line,
+                    re.I,
+                ):
+                    property_type = next_line
+                    continue
+
+                if re.fullmatch(r"PAY\s+TAXES", next_line, re.I):
+                    pay_taxes_found = True
+                    break
+
+            # Avoid treating unrelated eight-digit values elsewhere on the
+            # county page as property results.
+            if not pay_taxes_found:
+                continue
+
+            # Exclude headers and pagination text accidentally captured as
+            # owner/address values.
+            invalid_owner = bool(
+                re.search(
+                    r"RESULTS?|CURRENT PAGE|FIRST PAGE|PREVIOUS PAGE|"
+                    r"NEXT PAGE|LAST PAGE|OWNER ADDRESS|DELINQUENT TAX",
+                    result_owner,
+                    re.I,
+                )
+            )
+
+            invalid_address = bool(
+                re.search(
+                    r"RESULTS?|CURRENT PAGE|FIRST PAGE|PREVIOUS PAGE|"
+                    r"NEXT PAGE|LAST PAGE|OWNER ADDRESS",
+                    property_address,
+                    re.I,
+                )
+            )
+
+            if invalid_owner or invalid_address:
+                continue
+
+            dedupe_key = (
+                normalize_owner(result_owner),
+                pin,
+                normalize_space(property_address).upper(),
+            )
+
+            if dedupe_key in seen:
+                continue
+
+            seen.add(dedupe_key)
+            page_rows_found += 1
+
+            raw_row_text = " | ".join(
+                filter(
+                    None,
+                    [
+                        result_owner,
+                        property_address,
+                        pin,
+                        property_type,
+                        "PAY TAXES",
+                    ],
+                )
+            )
+
+            results.append(
+                SearchResult(
+                    searched_owner=searched_owner,
+                    owner_key=owner_key,
+                    search_status="found",
+                    result_owner=result_owner,
+                    parcel_id=pin,
+                    property_address=property_address,
+                    raw_row_text=raw_row_text,
+                    source_url=page.url,
+                    searched_at_utc=utc_now(),
+                )
+            )
+
+        # Record the visible current-page state to prevent pagination loops.
+        page_signature = "|".join(
+            [
+                page.url,
+                str(page_rows_found),
+                results[-1].parcel_id if results else "",
+                normalize_space(body_text)[:300],
+            ]
+        )
+
+        if page_signature in visited_pages:
+            break
+
+        visited_pages.add(page_signature)
+
+        # Find the exact pagination control rather than any site-wide link.
         next_candidates = [
             page.get_by_role(
                 "link",
-                name=re.compile(r"^(next|>)$", re.I),
+                name=re.compile(r"^\s*Next Page\s*$", re.I),
             ),
             page.get_by_role(
                 "button",
-                name=re.compile(r"^(next|>)$", re.I),
+                name=re.compile(r"^\s*Next Page\s*$", re.I),
             ),
             page.locator(
-                "a[aria-label*='next' i], "
-                "button[aria-label*='next' i], "
-                "a[title*='next' i], "
-                "button[title*='next' i]"
+                'a[aria-label="Next Page" i], '
+                'button[aria-label="Next Page" i], '
+                'a[title="Next Page" i], '
+                'button[title="Next Page" i]'
             ),
         ]
 
-        next_control = None
+        next_button = None
 
-        for candidate in next_candidates:
-            for candidate_index in range(await candidate.count()):
-                element = candidate.nth(candidate_index)
+        for locator in next_candidates:
+            for candidate_index in range(await locator.count()):
+                candidate = locator.nth(candidate_index)
 
                 try:
-                    if not await element.is_visible():
+                    if not await candidate.is_visible():
                         continue
 
                     disabled = (
-                        await element.get_attribute("disabled") is not None
-                        or (await element.get_attribute("aria-disabled") or "").lower()
+                        await candidate.get_attribute("disabled") is not None
+                        or (
+                            await candidate.get_attribute("aria-disabled")
+                            or ""
+                        ).lower()
                         == "true"
                         or "disabled"
-                        in (await element.get_attribute("class") or "").lower()
+                        in (
+                            await candidate.get_attribute("class")
+                            or ""
+                        ).lower()
                     )
 
                     if not disabled:
-                        next_control = element
+                        next_button = candidate
                         break
                 except Exception:
                     continue
 
-            if next_control is not None:
+            if next_button is not None:
                 break
 
-        if next_control is None:
+        if next_button is None:
             break
 
-        old_first_pin = results[-1].parcel_id if results else ""
+        previous_body = body_text
 
         try:
-            await next_control.click()
-            await page.wait_for_load_state("networkidle", timeout=30_000)
+            await next_button.click()
+
+            await page.wait_for_function(
+                """
+                previousBody => {
+                    const currentBody =
+                        document.body ? document.body.innerText : "";
+
+                    return currentBody !== previousBody;
+                }
+                """,
+                arg=previous_body,
+                timeout=30_000,
+            )
+
             await page.wait_for_timeout(750)
-
-            # Prevent an endless loop if the page control did not advance.
-            current_text = normalize_space(await page.locator("body").inner_text())
-
-            if old_first_pin and current_text.count(old_first_pin) > 0:
-                # It may still be present elsewhere, so only stop when no new
-                # PAY TAXES result can be identified on another pass.
-                current_count = len(results)
-                await page.wait_for_timeout(300)
-
-                if len(results) == current_count:
-                    break
 
         except Exception:
             break
