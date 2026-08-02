@@ -464,7 +464,7 @@ async def submit_search(page: Page, owner: str) -> None:
     # asynchronously while leaving the URL unchanged.
     try:
         await page.wait_for_function(
-            """
+            r"""
             ([owner, oldHtml]) => {
                 const body = document.body
                     ? document.body.innerText
@@ -592,125 +592,92 @@ async def parse_results_from_page(
     owner_key: str,
 ) -> list[SearchResult]:
     """
-    Parse the rendered Sedgwick County result pages.
+    Parse all pages of Sedgwick County delinquent-tax results from rendered
+    body text.
 
-    The county's visual grid does not use a dependable conventional table
-    structure. Its rendered text consistently follows this pattern:
+    Each result follows this rendered pattern:
 
-        Owner
-        Address
-        8-digit PIN
+        OWNER
+        PROPERTY ADDRESS
+        8-DIGIT PIN
         Real / Personal / Mobile Home
         PAY TAXES
 
-    Parse around the PIN and then advance through pagination.
+    The county may collapse those fields onto the same line, so parsing by
+    splitlines is unreliable.
     """
     results: list[SearchResult] = []
     seen: set[tuple[str, str, str]] = set()
-    visited_pages: set[str] = set()
+    visited_urls: set[str] = set()
+
+    owner_pattern = re.escape(normalize_space(searched_owner))
+
+    row_pattern = re.compile(
+        rf"""
+        (?P<owner>{owner_pattern})
+        \s+
+        (?P<address>.*?)
+        \s+
+        (?P<pin>\d{{8}})
+        \s+
+        (?P<property_type>Real|Personal|Mobile\s+Home)
+        \s+
+        PAY\s+TAXES
+        """,
+        re.I | re.S | re.X,
+    )
 
     while True:
         await page.wait_for_timeout(750)
 
-        body_text = await page.locator("body").inner_text()
+        current_url = page.url
 
-        # Preserve visible line boundaries while removing blank lines.
-        lines = [
-            normalize_space(line)
-            for line in body_text.splitlines()
-            if normalize_space(line)
-        ]
+        if current_url in visited_urls:
+            break
 
-        page_rows_found = 0
+        visited_urls.add(current_url)
 
-        for index, line in enumerate(lines):
-            # County PIN is displayed as exactly eight digits.
-            if not re.fullmatch(r"\d{8}", line):
-                continue
+        body_text = normalize_space(
+            await page.locator("body").inner_text()
+        )
 
-            if index < 2:
-                continue
+        page_matches = 0
 
-            pin = line
-            result_owner = lines[index - 2]
-            property_address = lines[index - 1]
+        for match in row_pattern.finditer(body_text):
+            result_owner = normalize_space(match.group("owner"))
+            property_address = normalize_space(match.group("address"))
+            pin = normalize_space(match.group("pin"))
+            property_type = normalize_space(match.group("property_type"))
 
-            property_type = ""
-            pay_taxes_found = False
-
-            # Usually type immediately follows PIN and PAY TAXES follows type.
-            for offset in range(1, 5):
-                next_index = index + offset
-
-                if next_index >= len(lines):
-                    break
-
-                next_line = lines[next_index]
-
-                if re.fullmatch(
-                    r"(?:REAL|PERSONAL|MOBILE\s+HOME)",
-                    next_line,
-                    re.I,
-                ):
-                    property_type = next_line
-                    continue
-
-                if re.fullmatch(r"PAY\s+TAXES", next_line, re.I):
-                    pay_taxes_found = True
-                    break
-
-            # Avoid treating unrelated eight-digit values elsewhere on the
-            # county page as property results.
-            if not pay_taxes_found:
-                continue
-
-            # Exclude headers and pagination text accidentally captured as
-            # owner/address values.
-            invalid_owner = bool(
-                re.search(
-                    r"RESULTS?|CURRENT PAGE|FIRST PAGE|PREVIOUS PAGE|"
-                    r"NEXT PAGE|LAST PAGE|OWNER ADDRESS|DELINQUENT TAX",
-                    result_owner,
-                    re.I,
-                )
+            # Remove pagination/table-header text that can occur immediately
+            # before the first result address.
+            property_address = re.sub(
+                r"""
+                ^.*?
+                Owner\s+Address\s+PIN\s+Type
+                \s*
+                """,
+                "",
+                property_address,
+                flags=re.I | re.S | re.X,
             )
 
-            invalid_address = bool(
-                re.search(
-                    r"RESULTS?|CURRENT PAGE|FIRST PAGE|PREVIOUS PAGE|"
-                    r"NEXT PAGE|LAST PAGE|OWNER ADDRESS",
-                    property_address,
-                    re.I,
-                )
-            )
+            property_address = normalize_space(property_address)
 
-            if invalid_owner or invalid_address:
+            if not property_address:
                 continue
 
             dedupe_key = (
                 normalize_owner(result_owner),
                 pin,
-                normalize_space(property_address).upper(),
+                property_address.upper(),
             )
 
             if dedupe_key in seen:
                 continue
 
             seen.add(dedupe_key)
-            page_rows_found += 1
-
-            raw_row_text = " | ".join(
-                filter(
-                    None,
-                    [
-                        result_owner,
-                        property_address,
-                        pin,
-                        property_type,
-                        "PAY TAXES",
-                    ],
-                )
-            )
+            page_matches += 1
 
             results.append(
                 SearchResult(
@@ -720,72 +687,60 @@ async def parse_results_from_page(
                     result_owner=result_owner,
                     parcel_id=pin,
                     property_address=property_address,
-                    raw_row_text=raw_row_text,
-                    source_url=page.url,
+                    raw_row_text=(
+                        f"{result_owner} | "
+                        f"{property_address} | "
+                        f"{pin} | "
+                        f"{property_type} | "
+                        "PAY TAXES"
+                    ),
+                    source_url=current_url,
                     searched_at_utc=utc_now(),
                 )
             )
 
-        # Record the visible current-page state to prevent pagination loops.
-        page_signature = "|".join(
-            [
-                page.url,
-                str(page_rows_found),
-                results[-1].parcel_id if results else "",
-                normalize_space(body_text)[:300],
-            ]
-        )
-
-        if page_signature in visited_pages:
-            break
-
-        visited_pages.add(page_signature)
-
-        # Find the exact pagination control rather than any site-wide link.
+        # Find the county's exact Next Page control.
         next_candidates = [
             page.get_by_role(
                 "link",
                 name=re.compile(r"^\s*Next Page\s*$", re.I),
             ),
-            page.get_by_role(
-                "button",
-                name=re.compile(r"^\s*Next Page\s*$", re.I),
-            ),
             page.locator(
                 'a[aria-label="Next Page" i], '
-                'button[aria-label="Next Page" i], '
-                'a[title="Next Page" i], '
-                'button[title="Next Page" i]'
+                'a[title="Next Page" i]'
             ),
         ]
 
         next_button = None
 
         for locator in next_candidates:
-            for candidate_index in range(await locator.count()):
-                candidate = locator.nth(candidate_index)
+            for index in range(await locator.count()):
+                candidate = locator.nth(index)
 
                 try:
                     if not await candidate.is_visible():
                         continue
 
-                    disabled = (
-                        await candidate.get_attribute("disabled") is not None
-                        or (
-                            await candidate.get_attribute("aria-disabled")
-                            or ""
-                        ).lower()
-                        == "true"
-                        or "disabled"
-                        in (
-                            await candidate.get_attribute("class")
-                            or ""
-                        ).lower()
-                    )
+                    href = await candidate.get_attribute("href")
+                    aria_disabled = (
+                        await candidate.get_attribute("aria-disabled") or ""
+                    ).lower()
 
-                    if not disabled:
-                        next_button = candidate
-                        break
+                    classes = (
+                        await candidate.get_attribute("class") or ""
+                    ).lower()
+
+                    if (
+                        not href
+                        or href in {"#", "javascript:void(0)"}
+                        or aria_disabled == "true"
+                        or "disabled" in classes
+                    ):
+                        continue
+
+                    next_button = candidate
+                    break
+
                 except Exception:
                     continue
 
@@ -795,21 +750,23 @@ async def parse_results_from_page(
         if next_button is None:
             break
 
+        previous_url = page.url
         previous_body = body_text
 
         try:
             await next_button.click()
 
             await page.wait_for_function(
-                """
-                previousBody => {
+                r"""
+                ([oldUrl, oldBody]) => {
                     const currentBody =
                         document.body ? document.body.innerText : "";
 
-                    return currentBody !== previousBody;
+                    return window.location.href !== oldUrl
+                        || currentBody !== oldBody;
                 }
                 """,
-                arg=previous_body,
+                arg=[previous_url, previous_body],
                 timeout=30_000,
             )
 
